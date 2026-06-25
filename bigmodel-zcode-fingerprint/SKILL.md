@@ -1,7 +1,7 @@
 ---
 name: bigmodel-zcode-fingerprint
 description: "Fix BigModel/GLM error 1305 rate-limiting by matching ZCode's exact HTTP fingerprint."
-version: 1.0.0
+version: 1.1.0
 author: KeaneYan
 license: MIT
 metadata:
@@ -14,8 +14,8 @@ metadata:
 ## Problem
 
 BigModel (Zhipu) serves GLM models via an Anthropic-compatible endpoint at
-`https://open.bigmodel.cn/api/anthropic`. BigModel's own coding agent (ZCode)
-uses this same endpoint.
+`https://open.bigmodel.cn/api/anthropic` (or `https://api.z.ai/api/anthropic`).
+BigModel's own coding agent (ZCode) uses this same endpoint.
 
 BigModel uses **request fingerprinting** to distinguish real ZCode clients
 from impostors. When it detects non-ZCode traffic, it applies aggressive
@@ -26,106 +26,123 @@ auto-injects **7 `X-Stainless-*` telemetry headers** and **`anthropic-beta`**
 headers that ZCode never sends. BigModel treats these as a non-ZCode signal
 and throttles.
 
-Meanwhile, ZCode (built on Vercel AI SDK / TypeScript) sends none of these
-Stainless headers, uses **manual thinking** instead of adaptive, and sends
-**uppercase model names** (`GLM-5.2` not `glm-5.2`).
+Additionally, Hermes was using adaptive thinking (vs ZCode's manual thinking),
+was sending `temperature=1` (ZCode doesn't), was missing `x-query-id` and
+`x-session-id` headers, and was sending lowercase model names (`glm-5.2`
+instead of ZCode's `GLM-5.2`).
 
 ## Solution
 
-Three changes in `agent/anthropic_adapter.py`:
+Four changes in `agent/anthropic_adapter.py`:
 
 1. **Strip `X-Stainless-*` and `anthropic-beta` headers** via an httpx
-   `event_hooks` callback on a custom `httpx.Client`.
+   `event_hooks` callback on a custom `httpx.Client` (replaces the old
+   `None`-value approach that crashed on httpx ≥0.80).
 2. **Switch to manual thinking** (`{"type":"enabled","budget_tokens":N}`) and
    drop `temperature` for BigModel endpoints.
 3. **Uppercase the model name** (`glm-5.2` → `GLM-5.2`).
 4. **Add `x-query-id` and `x-session-id`** per-request headers.
 
-## How to Apply
-
-### Prerequisites
+## Prerequisites
 
 - Hermes Agent source code at `~/.hermes/hermes-agent/`
 - The file `agent/anthropic_adapter.py` must exist
 - Python venv with httpx installed
-- **GLM provider must be configured with `api_mode: anthropic_messages`**.
-  The fingerprint matching code lives in the Anthropic adapter and only runs
-  when requests go through the Anthropic Messages API path. If GLM is
-  configured as `chat_completions`, none of these changes take effect.
+- **GLM provider must be configured with `api_mode: anthropic_messages`** —
+  the fingerprint matching code only runs on the Anthropic Messages API path
 
-### GLM Provider Configuration
+## GLM Provider Configuration
 
-In `~/.hermes/config.yaml`, the GLM provider must look like this:
+In `~/.hermes/config.yaml`, the GLM provider must be configured as:
 
 ```yaml
 providers:
   custom:
     glm-anthropic:
       base_url: https://open.bigmodel.cn/api/anthropic
-      api_key: ${GLM_API_KEY}
-      api_mode: anthropic_messages   # ← CRITICAL: must be anthropic_messages
+      api_key: ${GLM_API_KEY}            # read from ~/.hermes/.env
+      api_mode: anthropic_messages       # ← CRITICAL: must be anthropic_messages
       models:
         glm-5.2:
+          context_length: 200000
+          max_tokens: 64000
           reasoning:
             enabled: true
-            effort: xhigh
+            effort: xhigh                # → budget_tokens=32000, output effort=max
 ```
 
-Key points:
-- `api_mode: anthropic_messages` — routes through `agent/anthropic_adapter.py`
-  where the ZCode fingerprint matching lives. Without this, the ChatCompletions
-  transport is used instead and none of the fixes apply.
-- `base_url` must contain `open.bigmodel.cn` or `api.z.ai` to trigger
+Then in `~/.hermes/.env`:
+```
+GLM_API_KEY=your-bigmodel-api-key
+```
+
+### Notes
+
+- **`api_mode: anthropic_messages`** is required — without it, requests go
+  through the ChatCompletions transport and none of the fingerprint matching
+  code runs.
+- **`base_url`** must contain `open.bigmodel.cn` or `api.z.ai` to trigger
   `_is_bigmodel_endpoint()` detection.
-- `reasoning.effort` maps to GLM's thinking budget: `xhigh` → 32000 tokens.
+- **`api.z.ai`** is Zhipu's alternative endpoint — both work with this fix.
+- **`max_tokens: 64000`** matches ZCode's default output cap for GLM-5.2.
+- **`reasoning.effort: xhigh`** maps to `budget_tokens=32000` and
+  `output_config.effort=max` (matching ZCode). See the budget mapping table
+  in `references/fingerprint-comparison.md`.
 
-### Steps
+## How to Apply
 
-1. **Read the current code** to locate the insertion points:
-   ```bash
-   grep -n '_is_bigmodel_endpoint\|def build_anthropic_client\|def build_anthropic_kwargs' \
-     ~/.hermes/hermes-agent/agent/anthropic_adapter.py
-   ```
+### Step 1: Locate insertion points
 
-2. **Apply the patch** from `references/code-patch.diff`:
-   ```bash
-   cd ~/.hermes/hermes-agent
-   git apply references/code-patch.diff
-   ```
+```bash
+grep -n '_is_bigmodel_endpoint\|def build_anthropic_client\|def build_anthropic_kwargs' \
+  ~/.hermes/hermes-agent/agent/anthropic_adapter.py
+```
 
-   If `git apply` fails due to line drift, use `patch -p1` instead, or apply
-   the changes manually following the instructions in
-   `references/manual-application-guide.md`.
+### Step 2: Apply the patch
 
-3. **Restart the gateway** (or CLI) to load the changes:
-   ```bash
-   hermes gateway restart
-   ```
+```bash
+cd ~/.hermes/hermes-agent
+git apply /path/to/references/code-patch.diff
+```
 
-4. **Verify** the fingerprint matches ZCode:
-   ```bash
-   cd ~/.hermes/hermes-agent
-   venv/bin/python3 << 'PY'
-   import httpx
-   from agent.anthropic_adapter import build_anthropic_client
+If `git apply` fails (line drift, local modifications), apply the changes
+manually following `references/manual-application-guide.md`.
 
-   client = build_anthropic_client(
-       api_key="test",
-       base_url="https://open.bigmodel.cn/api/anthropic",
-   )
-   req = httpx.Request("POST", "https://open.bigmodel.cn/api/anthropic/v1/messages",
-                       headers=dict(client.default_headers), json={"model": "GLM-5.2"})
-   for hook in client._client.event_hooks.get("request", []):
-       hook(req)
-   for k in sorted(req.headers.keys()):
-       if k not in ("host", "content-length"):
-           print(f"  {k}: {req.headers[k]}")
-   PY
-   ```
-   Expected: NO `x-stainless-*` or `anthropic-beta` headers. ZCode headers
-   present (`user-agent: ZCode/3.1.2`, `x-zcode-*`, `x-query-id`, `x-session-id`).
+### Step 3: Restart
 
-## Code Locations (in agent/anthropic_adapter.py)
+```bash
+hermes gateway restart
+```
+
+### Step 4: Verify
+
+```bash
+cd ~/.hermes/hermes-agent
+venv/bin/python3 -c '
+import httpx
+from agent.anthropic_adapter import build_anthropic_client
+
+client = build_anthropic_client(
+    api_key="test",
+    base_url="https://open.bigmodel.cn/api/anthropic",
+)
+req = httpx.Request("POST", "https://open.bigmodel.cn/api/anthropic/v1/messages",
+                    headers=dict(client.default_headers), json={"model": "GLM-5.2"})
+for hook in client._client.event_hooks.get("request", []):
+    hook(req)
+
+stainless = any(k.startswith("x-stainless") for k in req.headers.keys())
+beta = "anthropic-beta" in req.headers
+print("X-Stainless stripped:", "OK" if not stainless else "FAIL")
+print("anthropic-beta stripped:", "OK" if not beta else "FAIL")
+print("x-query-id present:", "OK" if "x-query-id" in req.headers else "FAIL")
+print("x-session-id present:", "OK" if "x-session-id" in req.headers else "FAIL")
+'
+```
+
+Expected: all four lines print `OK`.
+
+## Code Locations
 
 | Location | Function | What it does |
 |----------|----------|-------------|
@@ -135,6 +152,52 @@ Key points:
 
 Exact line numbers may shift with Hermes updates. Search for `_is_bigmodel_endpoint`
 to find the right spots.
+
+## ZCode Version
+
+The `ZCode/3.1.2` version string and headers were captured from a specific
+ZCode release. To check for newer versions:
+
+```bash
+# If ZCode is installed locally:
+grep -o 'ZCode/[0-9.]+' /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs | head -1
+
+# Or check the app version:
+defaults read /Applications/ZCode.app/Contents/Info.plist CFBundleShortVersionString
+```
+
+If BigModel changes the fingerprint in a future ZCode release, re-capture the
+headers from ZCode's rollout data (see below) and update the code accordingly.
+
+## Troubleshooting
+
+### Still getting error 1305 after applying the fix
+
+1. **Verify `api_mode`**: Check `~/.hermes/config.yaml` — must be
+   `anthropic_messages`, not `chat_completions`.
+2. **Verify `base_url`**: Must contain `open.bigmodel.cn` or `api.z.ai`.
+3. **Check the gateway log** for TypeError or import errors:
+   ```bash
+   tail -50 ~/.hermes/logs/gateway.error.log
+   ```
+4. **Run the verification script** (Step 4 above) — if it prints FAIL,
+   the code wasn't applied correctly.
+5. **Restart the gateway** to load the new code:
+   ```bash
+   hermes gateway restart
+   ```
+6. **Check for code conflicts**: If you have other patches to
+   `anthropic_adapter.py`, ensure they don't override the BigModel block.
+
+### TypeError: Header value must be str or bytes
+
+This means the old `None`-value code is still active. Ensure you replaced
+the `headers["X-Stainless-*"] = None` lines with the httpx event hook.
+
+### Patch doesn't apply (git apply fails)
+
+Your Hermes version may differ. Use `references/manual-application-guide.md`
+to apply the changes manually.
 
 ## What NOT to Change
 
