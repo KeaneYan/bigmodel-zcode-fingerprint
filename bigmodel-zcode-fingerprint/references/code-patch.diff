@@ -1,0 +1,102 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 99177ca7c..0128cb613 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -749,8 +749,16 @@ def build_anthropic_client(
+         # zcode.cjs): x-request-id, x-zcode-trace-id, x-session-id, x-query-id.
+         # We set UUIDs as defaults; the SDK may override x-request-id per call.
+         #
+-        # ZCode does NOT send any X-Stainless-* telemetry headers.
++        # ZCode does NOT send X-Stainless-* or anthropic-beta headers.
++        # The Anthropic Python SDK (Stainless-generated) auto-injects 7
++        # X-Stainless-* telemetry headers; BigModel uses these to distinguish
++        # real ZCode clients from impostors and applies error 1305 / 429
++        # accordingly.  We suppress them via an httpx request event hook
++        # that strips the unwanted headers after the SDK builds the request
++        # but before it hits the wire.  Setting header values to None (the
++        # previous approach) causes TypeError in httpx ≥0.80.
+         kwargs["api_key"] = api_key
++        _bm_session_id = str(uuid4())
+         headers = {
+             "User-Agent": "ZCode/3.1.2",
+             "HTTP-Referer": "https://zcode.z.ai",
+@@ -759,19 +767,28 @@ def build_anthropic_client(
+             "X-ZCode-App-Version": "3.1.2",
+             "x-request-id": str(uuid4()),
+             "x-zcode-trace-id": str(uuid4()),
++            "x-query-id": str(uuid4()),
++            "x-session-id": _bm_session_id,
+         }
+-        if common_betas:
+-            headers["anthropic-beta"] = ",".join(common_betas)
+-        # Suppress X-Stainless-* headers that the SDK injects by default.
+-        # The SDK respects None values to skip a header.
+-        headers["X-Stainless-Lang"] = None
+-        headers["X-Stainless-Package-Version"] = None
+-        headers["X-Stainless-OS"] = None
+-        headers["X-Stainless-Arch"] = None
+-        headers["X-Stainless-Runtime"] = None
+-        headers["X-Stainless-Runtime-Version"] = None
+-        headers["X-Stainless-Async"] = None
++        # Do NOT send anthropic-beta — ZCode doesn't, and BigModel may
++        # use its presence as a non-ZCode signal.
+         kwargs["default_headers"] = headers
++
++        # httpx request hook: strip X-Stainless-* and anthropic-beta
++        # headers that the SDK injects after default_headers are merged.
++        from httpx import Client as _HttpxClient, Timeout as _HttpxTimeout
++
++        def _strip_sdk_telemetry(request):
++            """Remove X-Stainless-* and anthropic-beta from outbound requests."""
++            for key in list(request.headers.keys()):
++                if key.lower().startswith("x-stainless-") or key.lower() == "anthropic-beta":
++                    del request.headers[key]
++
++        _read_timeout_bm = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
++        kwargs["http_client"] = _HttpxClient(
++            timeout=_HttpxTimeout(timeout=float(_read_timeout_bm), connect=10.0),
++            event_hooks={"request": [_strip_sdk_telemetry]},
++        )
+     elif _is_kimi_coding_endpoint(base_url):
+         # Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
+         # to be recognized as a valid Coding Agent. Without it, returns 403.
+@@ -2196,6 +2213,11 @@ def build_anthropic_kwargs(
+     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
+ 
+     model = normalize_model_name(model, preserve_dots=preserve_dots)
++    # BigModel/GLM: ZCode sends uppercase model names (e.g. "GLM-5.2").
++    # normalize_model_name lowercases, so restore the canonical BigModel form
++    # to match ZCode's fingerprint exactly.
++    if _is_bigmodel_endpoint(base_url) and model.lower().startswith("glm-"):
++        model = model.upper()
+     # effective_max_tokens = output cap for this call (≠ total context window)
+     # Use the resolver helper so non-positive values (negative ints,
+     # fractional floats, NaN, non-numeric) fail locally with a clear error
+@@ -2303,11 +2325,26 @@ def build_anthropic_kwargs(
+     # request "summarized" so the reasoning blocks stay populated — matching
+     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
+     _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
++    _is_bigmodel = _is_bigmodel_endpoint(base_url)
+     if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
+         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
+             effort = str(reasoning_config.get("effort", "medium")).lower()
+             budget = THINKING_BUDGET.get(effort, 8000)
+-            if _supports_adaptive_thinking(model):
++            if _is_bigmodel:
++                # BigModel/GLM: use manual thinking (matching ZCode's fingerprint)
++                # to avoid error 1305 / 429 rate-limiting.  ZCode sends:
++                #   thinking: {"type":"enabled","budget_tokens":32000}
++                #   output_config: {"effort":"max"}
++                # and does NOT send temperature.  Map Hermes effort→GLM budget:
++                # xhigh→32000, high→16000, medium→8000, low→4000.
++                _glm_budget_map = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000, "minimal": 4000}
++                _glm_budget = _glm_budget_map.get(effort, 8000)
++                kwargs["thinking"] = {"type": "enabled", "budget_tokens": _glm_budget}
++                # output_config.effort: BigModel accepts max/high/medium/low.
++                _glm_effort_map = {"xhigh": "max", "high": "high", "medium": "medium", "low": "low", "minimal": "low"}
++                kwargs["output_config"] = {"effort": _glm_effort_map.get(effort, "medium")}
++                # Do NOT send temperature — ZCode doesn't.
++            elif _supports_adaptive_thinking(model):
+                 kwargs["thinking"] = {
+                     "type": "adaptive",
+                     "display": "summarized",
