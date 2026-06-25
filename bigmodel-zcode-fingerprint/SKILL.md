@@ -48,6 +48,36 @@ Three changes in `agent/anthropic_adapter.py`:
 - Hermes Agent source code at `~/.hermes/hermes-agent/`
 - The file `agent/anthropic_adapter.py` must exist
 - Python venv with httpx installed
+- **GLM provider must be configured with `api_mode: anthropic_messages`**.
+  The fingerprint matching code lives in the Anthropic adapter and only runs
+  when requests go through the Anthropic Messages API path. If GLM is
+  configured as `chat_completions`, none of these changes take effect.
+
+### GLM Provider Configuration
+
+In `~/.hermes/config.yaml`, the GLM provider must look like this:
+
+```yaml
+providers:
+  custom:
+    glm-anthropic:
+      base_url: https://open.bigmodel.cn/api/anthropic
+      api_key: ${GLM_API_KEY}
+      api_mode: anthropic_messages   # ← CRITICAL: must be anthropic_messages
+      models:
+        glm-5.2:
+          reasoning:
+            enabled: true
+            effort: xhigh
+```
+
+Key points:
+- `api_mode: anthropic_messages` — routes through `agent/anthropic_adapter.py`
+  where the ZCode fingerprint matching lives. Without this, the ChatCompletions
+  transport is used instead and none of the fixes apply.
+- `base_url` must contain `open.bigmodel.cn` or `api.z.ai` to trigger
+  `_is_bigmodel_endpoint()` detection.
+- `reasoning.effort` maps to GLM's thinking budget: `xhigh` → 32000 tokens.
 
 ### Steps
 
