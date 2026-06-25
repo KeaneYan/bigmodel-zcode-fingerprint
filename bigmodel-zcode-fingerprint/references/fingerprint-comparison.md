@@ -30,12 +30,15 @@ and Hermes's runtime (via httpx request inspection).
 ### Hermes Headers (Before Fix)
 
 Same ZCode headers PLUS 7 `X-Stainless-*` headers + `anthropic-beta`, MINUS
-`x-query-id` and `x-session-id`.
+`x-query-id` and `x-session-id`. Additionally, the old code tried to suppress
+`X-Stainless-*` by setting header values to `None`, which caused
+`TypeError: Header value must be str or bytes` on httpx ≥0.80.
 
 ### Hermes Headers (After Fix)
 
 **Identical to ZCode.** The httpx event hook strips `X-Stainless-*` and
 `anthropic-beta` after the SDK merges them but before the request goes out.
+The `None`-value approach was replaced with the event hook.
 
 ---
 
@@ -85,8 +88,8 @@ Same ZCode headers PLUS 7 `X-Stainless-*` headers + `anthropic-beta`, MINUS
 BigModel's endpoint at `open.bigmodel.cn/api/anthropic` is shared between
 ZCode (their official coding agent) and third-party clients using API keys.
 BigModel appears to use request fingerprinting — specifically the presence of
-`X-Stainless-*` headers, `anthropic-beta`, and the thinking mode — to classify
-traffic and apply different rate-limit thresholds:
+`X-Stainless-*` headers, `anthropic-beta`, the thinking mode, and model name
+casing — to classify traffic and apply different rate-limit thresholds:
 
 - **ZCode fingerprint** → higher rate limit (official client)
 - **Non-ZCode fingerprint** → aggressive rate-limiting (error 1305 / 429)
