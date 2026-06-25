@@ -6,9 +6,10 @@ apply the three changes manually.
 ## Change 1: Headers + Strip Hook (in `build_anthropic_client`)
 
 Find the `_is_bigmodel_endpoint(base_url)` branch inside `build_anthropic_client`
-(search for `if _is_bigmodel_endpoint`). Replace the header block:
+(search for `if _is_bigmodel_endpoint`). Replace the header block.
 
-### Before
+### Before (upstream code)
+
 ```python
         kwargs["api_key"] = api_key
         headers = {
@@ -22,10 +23,20 @@ Find the `_is_bigmodel_endpoint(base_url)` branch inside `build_anthropic_client
         }
         if common_betas:
             headers["anthropic-beta"] = ",".join(common_betas)
+        # Suppress X-Stainless-* headers that the SDK injects by default.
+        # The SDK respects None values to skip a header.
+        headers["X-Stainless-Lang"] = None
+        headers["X-Stainless-Package-Version"] = None
+        headers["X-Stainless-OS"] = None
+        headers["X-Stainless-Arch"] = None
+        headers["X-Stainless-Runtime"] = None
+        headers["X-Stainless-Runtime-Version"] = None
+        headers["X-Stainless-Async"] = None
         kwargs["default_headers"] = headers
 ```
 
 ### After
+
 ```python
         kwargs["api_key"] = api_key
         _bm_session_id = str(uuid4())
@@ -40,8 +51,12 @@ Find the `_is_bigmodel_endpoint(base_url)` branch inside `build_anthropic_client
             "x-query-id": str(uuid4()),
             "x-session-id": _bm_session_id,
         }
+        # Do NOT send anthropic-beta — ZCode doesn't, and BigModel may
+        # use its presence as a non-ZCode signal.
         kwargs["default_headers"] = headers
 
+        # httpx request hook: strip X-Stainless-* and anthropic-beta
+        # headers that the SDK injects after default_headers are merged.
         from httpx import Client as _HttpxClient, Timeout as _HttpxTimeout
 
         def _strip_sdk_telemetry(request):
@@ -61,7 +76,13 @@ Find the `_is_bigmodel_endpoint(base_url)` branch inside `build_anthropic_client
 - `x-query-id` and `x-session-id` are NEW headers that ZCode sends.
 - The httpx event hook strips `X-Stainless-*` and `anthropic-beta` after the
   SDK merges its default headers but before the request goes on the wire.
-- Do NOT use `None` header values — httpx ≥0.80 throws TypeError.
+- Do NOT use `None` header values — httpx ≥0.80 throws TypeError. The old
+  code set them to `None` which caused crashes; the event hook is the fix.
+
+> **If your code doesn't have the `headers["X-Stainless-*"] = None` lines:**
+> Your Hermes version may already handle this differently. Just delete any
+> remaining `X-Stainless-*` suppression code and add the event hook + new
+> headers as shown above.
 
 ---
 
@@ -73,6 +94,8 @@ Find `model = normalize_model_name(model, preserve_dots=preserve_dots)` in
 ```python
     model = normalize_model_name(model, preserve_dots=preserve_dots)
     # BigModel/GLM: ZCode sends uppercase model names (e.g. "GLM-5.2").
+    # normalize_model_name lowercases, so restore the canonical BigModel form
+    # to match ZCode's fingerprint exactly.
     if _is_bigmodel_endpoint(base_url) and model.lower().startswith("glm-"):
         model = model.upper()
 ```
@@ -85,6 +108,7 @@ Find `_is_kimi_coding = _is_kimi_family_endpoint(base_url, model)` and the
 reasoning_config block. Add a `_is_bigmodel` check BEFORE `_supports_adaptive_thinking`:
 
 ### Before
+
 ```python
     _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
     if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
@@ -95,6 +119,7 @@ reasoning_config block. Add a `_is_bigmodel` check BEFORE `_supports_adaptive_th
 ```
 
 ### After
+
 ```python
     _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
     _is_bigmodel = _is_bigmodel_endpoint(base_url)
@@ -103,6 +128,7 @@ reasoning_config block. Add a `_is_bigmodel` check BEFORE `_supports_adaptive_th
             effort = str(reasoning_config.get("effort", "medium")).lower()
             budget = THINKING_BUDGET.get(effort, 8000)
             if _is_bigmodel:
+                # BigModel/GLM: use manual thinking (matching ZCode's fingerprint)
                 _glm_budget_map = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000, "minimal": 4000}
                 _glm_budget = _glm_budget_map.get(effort, 8000)
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": _glm_budget}
@@ -121,13 +147,13 @@ reasoning_config block. Add a `_is_bigmodel` check BEFORE `_supports_adaptive_th
 
 ## Verification
 
-After applying all three changes, restart the gateway and verify:
+After applying all three changes, restart and verify:
 
 ```bash
 hermes gateway restart
 
 cd ~/.hermes/hermes-agent
-venv/bin/python3 << 'PY'
+venv/bin/python3 -c '
 import httpx
 from agent.anthropic_adapter import build_anthropic_client
 
@@ -140,14 +166,14 @@ req = httpx.Request("POST", "https://open.bigmodel.cn/api/anthropic/v1/messages"
 for hook in client._client.event_hooks.get("request", []):
     hook(req)
 
-stainless_found = any(k.startswith("x-stainless") for k in req.headers.keys())
-beta_found = "anthropic-beta" in req.headers
+stainless = any(k.startswith("x-stainless") for k in req.headers.keys())
+beta = "anthropic-beta" in req.headers
 query_id = "x-query-id" in req.headers
 session_id = "x-session-id" in req.headers
 
-print(f"X-Stainless stripped: {"YES" if not stainless_found else "NO - PROBLEM"}")
-print(f"anthropic-beta stripped: {"YES" if not beta_found else "NO - PROBLEM"}")
-print(f"x-query-id present: {"YES" if query_id else "NO - PROBLEM"}")
-print(f"x-session-id present: {"YES" if session_id else "NO - PROBLEM"}")
-PY
+print("X-Stainless stripped:", "OK" if not stainless else "FAIL")
+print("anthropic-beta stripped:", "OK" if not beta else "FAIL")
+print("x-query-id present:", "OK" if query_id else "FAIL")
+print("x-session-id present:", "OK" if session_id else "FAIL")
+'
 ```
