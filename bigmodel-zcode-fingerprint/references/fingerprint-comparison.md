@@ -1,0 +1,95 @@
+# Fingerprint Comparison: ZCode vs Hermes
+
+## Headers
+
+Captured from ZCode's actual rollout data (`~/.zcode/cli/rollout/model-io-sess_*.jsonl`)
+and Hermes's runtime (via httpx request inspection).
+
+### ZCode Headers (Electron app, Vercel AI SDK)
+
+| Header | Value |
+|--------|-------|
+| `HTTP-Referer` | `https://zcode.z.ai` |
+| `User-Agent` | `ZCode/3.1.2` |
+| `X-Title` | `Z Code@electron` |
+| `X-ZCode-Agent` | `glm` |
+| `X-ZCode-App-Version` | `3.1.2` |
+| `x-request-id` | UUID (per-request) |
+| `x-zcode-trace-id` | UUID (per-request) |
+| `x-query-id` | UUID (per-request) |
+| `x-session-id` | Session UUID |
+| `x-api-key` | API key (injected by AI SDK) |
+| `anthropic-version` | `2023-06-01` (injected by AI SDK) |
+| `accept` | `application/json` (injected by AI SDK) |
+| `content-type` | `application/json` |
+
+**NOT sent by ZCode:**
+- `X-Stainless-Lang`, `X-Stainless-Package-Version`, `X-Stainless-OS`, `X-Stainless-Arch`, `X-Stainless-Runtime`, `X-Stainless-Runtime-Version`, `X-Stainless-Async`
+- `anthropic-beta`
+
+### Hermes Headers (Before Fix)
+
+Same ZCode headers PLUS 7 `X-Stainless-*` headers + `anthropic-beta`, MINUS
+`x-query-id` and `x-session-id`.
+
+### Hermes Headers (After Fix)
+
+**Identical to ZCode.** The httpx event hook strips `X-Stainless-*` and
+`anthropic-beta` after the SDK merges them but before the request goes out.
+
+---
+
+## Request Body
+
+### ZCode Body (from rollout)
+
+```json
+{
+  "model": "GLM-5.2",
+  "max_tokens": 64000,
+  "thinking": {"type": "enabled", "budget_tokens": 32000},
+  "output_config": {"effort": "max"},
+  "system": [...],
+  "tools": [...],
+  "tool_choice": {"type": "auto"},
+  "stream": true
+}
+```
+
+**Notable absences:** `temperature`, `top_p`, `top_k`, `metadata`, `stop_sequences`.
+
+### Hermes Body (After Fix)
+
+| Field | ZCode | Hermes (after fix) |
+|-------|-------|--------------------|
+| `model` | `GLM-5.2` (uppercase) | `GLM-5.2` (uppercased) |
+| `thinking` | `{"type":"enabled","budget_tokens":32000}` | Same structure, budget from effort mapping |
+| `output_config` | `{"effort":"max"}` | `{"effort":"max"}` (for xhigh effort) |
+| `temperature` | absent | absent |
+| `top_p` / `top_k` | absent | absent |
+| `anthropic-beta` | absent | absent |
+
+### Thinking Budget Mapping
+
+| Hermes effort | GLM `budget_tokens` | GLM `output_config.effort` |
+|---------------|---------------------|----------------------------|
+| `xhigh` | 32000 | `max` |
+| `high` | 16000 | `high` |
+| `medium` | 8000 | `medium` |
+| `low` / `minimal` | 4000 | `low` |
+
+---
+
+## Why the Differences Matter
+
+BigModel's endpoint at `open.bigmodel.cn/api/anthropic` is shared between
+ZCode (their official coding agent) and third-party clients using API keys.
+BigModel appears to use request fingerprinting — specifically the presence of
+`X-Stainless-*` headers, `anthropic-beta`, and the thinking mode — to classify
+traffic and apply different rate-limit thresholds:
+
+- **ZCode fingerprint** → higher rate limit (official client)
+- **Non-ZCode fingerprint** → aggressive rate-limiting (error 1305 / 429)
+
+After matching ZCode's fingerprint exactly, Hermes experiences the same
+rate-limit treatment as ZCode, eliminating the intermittent 1305 errors.
