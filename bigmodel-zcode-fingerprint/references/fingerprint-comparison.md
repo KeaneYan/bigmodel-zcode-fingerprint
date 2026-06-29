@@ -87,12 +87,16 @@ The `None`-value approach was replaced with the event hook.
 
 BigModel's endpoint at `open.bigmodel.cn/api/anthropic` is shared between
 ZCode (their official coding agent) and third-party clients using API keys.
-BigModel appears to use request fingerprinting — specifically the presence of
+BigModel uses request fingerprinting — specifically the presence of
 `X-Stainless-*` headers, `anthropic-beta`, the thinking mode, and model name
 casing — to classify traffic and apply different rate-limit thresholds:
 
-- **ZCode fingerprint** → higher rate limit (official client)
-- **Non-ZCode fingerprint** → aggressive rate-limiting (error 1305 / 429)
+- **ZCode fingerprint** → matches official client, avoids additional throttling
+- **Non-ZCode fingerprint** → may trigger more aggressive rate-limiting (error 1305 / 429)
 
-After matching ZCode's fingerprint exactly, Hermes experiences the same
-rate-limit treatment as ZCode, eliminating the intermittent 1305 errors.
+> **⚠️ Correction (2026-06-26):** Fingerprint matching reduces *some* 1305 errors
+> but does **not** eliminate them. The primary cause of persistent 1305 is
+> **server-side capacity throttling** during peak Chinese business hours
+> (9am–9pm CST), which affects all clients regardless of fingerprint. Hermes
+> and ZCode use the exact same API key — there is no auth-tier difference.
+> See the SKILL.md "1305 Root Cause" section for full evidence.
