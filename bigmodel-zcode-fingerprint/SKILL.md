@@ -195,7 +195,29 @@ shared Coding Plan endpoint pool.
   Fail fast to MiMo or another fallback provider.
 - **Stagger cron jobs**: Avoid scheduling at :00 — everyone hits the API then.
 - **Reduce context size**: Smaller requests = less server load = less likely
-  to trip capacity limits.
+  to trip capacity limits. Specific Hermes config that has been tested and
+  proven effective (~20-30% reduction in per-request context):
+
+  ```yaml
+  # ~/.hermes/config.yaml
+  compression:
+    enabled: true
+    threshold: 0.25          # was 0.35 — trigger compression earlier
+    target_ratio: 0.12       # was 0.15 — keep less after compression
+    protect_last_n: 8        # was 15 — protect fewer recent messages
+    hygiene_hard_message_limit: 250  # was 600 — cap total messages
+  agent:
+    disabled_toolsets:
+      - spotify
+      - image_gen
+      - video_gen
+      # add any toolsets you don't use (gaming, pet-care, mlops, etc.)
+  ```
+
+  Each disabled toolset saves ~1-3K tokens of tool schema per request.
+  `threshold: 0.25` means compression triggers when context reaches 25% of
+  `context_length` (e.g. 250K of 1M). Combined with the fingerprint fix,
+  this reduced typical request size from ~100-134K tokens to ~70-90K.
 
 ## ZCode OAuth → API Key Flow (Reverse-Engineered)
 
